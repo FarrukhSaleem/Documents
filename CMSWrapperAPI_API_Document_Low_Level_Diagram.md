@@ -1,8 +1,8 @@
-# CMS Wrapper API - Low Level Diagram
+# CMS Wrapper API - Updated Low Level Diagram
 
 Source: `CMSWrapperAPI.pdf`
 
-Scope: This document diagrams only the APIs explicitly listed in the supplied API document. It does not add project-specific routes, classes, handlers, database objects, queues, or APIs that are not present in the PDF.
+Scope: This document diagrams only the APIs explicitly listed in the supplied API document and the authentication path required to call those APIs. It does not add Chargemod, Emirates, vehicle recovery, station, database, queue, or any other non-CMS Wrapper API flow.
 
 ## Documented API Set
 
@@ -23,91 +23,156 @@ Scope: This document diagrams only the APIs explicitly listed in the supplied AP
 
 Document notes:
 
-- The Web Service URL table lists `TitleFetch` as `/api/endpoint/titlefetch`, while section `4.4.8` shows `/api/endpoint/getfiletemplate`. The diagram uses `/api/endpoint/titlefetch` from the API list.
-- The Web Service URL table lists `ResendTxn` as `/api/endpoint/resendtxn`, while section `4.4.11` shows `/api/endpoint/getstatus`. The diagram uses `/api/endpoint/resendtxn` from the API list.
-- Section `4.4.12` labels `RejectTxn` purpose as "Resend Transaction", but the API name, endpoint, request, and response describe rejection. The diagram treats it as reject transaction.
+- The Web Service URL table lists `TitleFetch` as `/api/endpoint/titlefetch`, while section `4.4.8` shows `/api/endpoint/getfiletemplate`. This diagram uses `/api/endpoint/titlefetch` from the API list.
+- The Web Service URL table lists `ResendTxn` as `/api/endpoint/resendtxn`, while section `4.4.11` shows `/api/endpoint/getstatus`. This diagram uses `/api/endpoint/resendtxn` from the API list.
+- Section `4.4.12` labels `RejectTxn` purpose as "Resend Transaction", but the API name, endpoint, request, and response describe rejection. This diagram treats it as reject transaction.
 
-## API Boundary Diagram
+## Updated Authentication Boundary
+
+The CMS Wrapper `Token` API still receives `ID` and `Password` as required by the API document. The updated implementation resolves those credentials from Key Vault before invoking `POST /api/token/getToken`.
 
 ```mermaid
 flowchart LR
     Client["Client application"]
 
-    subgraph CMS["CMS Wrapper API"]
-        Token["Token<br/>POST /api/token/getToken<br/>ID, Password -> accessToken"]
-        Jwt["JWT bearer token verification"]
-
-        subgraph Lookups["Lookup APIs"]
-            PrintLocation["GetPrintLocation<br/>/api/endpoint/getprintlocation"]
-            DeliverTo["GetDeliverTo<br/>/api/endpoint/getdeliverto"]
-            Product["GetProduct<br/>/api/endpoint/getproduct"]
-            Account["GetAccount<br/>/api/endpoint/getaccount"]
-            Instrument["GetInstrument<br/>/api/endpoint/getinstrument"]
-            FileTemplate["GetFileTemplate<br/>/api/endpoint/getfiletemplate"]
-            TitleFetch["TitleFetch<br/>/api/endpoint/titlefetch"]
-        end
-
-        subgraph Txn["Transaction APIs"]
-            TransSubmit["TransSubmit<br/>/api/endpoint/transsubmit"]
-            GetStatus["GetStatus<br/>/api/endpoint/getstatus"]
-            ResendTxn["ResendTxn<br/>/api/endpoint/resendtxn"]
-            RejectTxn["RejectTxn<br/>/api/endpoint/rejecttxn"]
-        end
+    subgraph App["ThirdPartyMgmtSystem - CMS Wrapper APIs only"]
+        DibAuth["DIB authentication middleware<br/>applies only to documented CMS Wrapper functions"]
+        Cache["Redis cache<br/>DIB_ACCESS_TOKEN"]
+        CredentialProvider["DibTokenCredentialProvider"]
+        SecretReader["KeyVaultSecretReader"]
+        RequestContext["RequestContext<br/>DIB bearer token slot"]
+        FunctionApi["Documented CMS Wrapper function<br/>GetPrintLocation ... RejectTxn"]
+        AtomicHandler["CMS Wrapper atomic handler<br/>calls one documented endpoint"]
     end
 
-    Vendor["TransPaymentAPI vendor endpoints"]
-    CoreDmz["Core / DMZ systems"]
+    KeyVault["Azure Key Vault<br/>AppVariables--BankApi--ID<br/>AppVariables--BankApi--Password"]
 
-    Client -->|"POST credentials"| Token
-    Token -->|"JWT accessToken"| Client
-    Client -->|"Bearer token + JSON request"| Jwt
+    subgraph Cms["CMS Wrapper downstream API document"]
+        Token["Token<br/>POST /api/token/getToken<br/>ID, Password -> accessToken"]
+        LookupApis["Lookup APIs<br/>GetPrintLocation, GetDeliverTo, GetProduct,<br/>GetAccount, GetInstrument, GetFileTemplate, TitleFetch"]
+        TransactionApis["Transaction APIs<br/>TransSubmit, GetStatus, ResendTxn, RejectTxn"]
+    end
 
-    Jwt --> PrintLocation
-    Jwt --> DeliverTo
-    Jwt --> Product
-    Jwt --> Account
-    Jwt --> Instrument
-    Jwt --> FileTemplate
-    Jwt --> TitleFetch
-    Jwt --> TransSubmit
-    Jwt --> GetStatus
-    Jwt --> ResendTxn
-    Jwt --> RejectTxn
+    Vendor["TransPaymentAPI / Core-DMZ"]
 
-    PrintLocation --> Vendor
-    DeliverTo --> Vendor
-    Product --> Vendor
-    Account --> Vendor
-    Instrument --> Vendor
-    FileTemplate --> Vendor
-    TitleFetch --> Vendor
-    TransSubmit --> Vendor
-    GetStatus --> Vendor
-    ResendTxn --> Vendor
-    RejectTxn --> Vendor
-
-    Vendor --> CoreDmz
+    Client -->|"POST JSON request"| DibAuth
+    DibAuth -->|"read cached token"| Cache
+    DibAuth -->|"cache miss"| CredentialProvider
+    CredentialProvider --> SecretReader
+    SecretReader -->|"read ID and Password secrets"| KeyVault
+    CredentialProvider -->|"ID, Password"| Token
+    Token -->|"accessToken"| DibAuth
+    DibAuth -->|"cache token"| Cache
+    DibAuth -->|"set bearer token"| RequestContext
+    RequestContext --> FunctionApi
+    FunctionApi --> AtomicHandler
+    AtomicHandler -->|"Bearer token + request payload"| LookupApis
+    AtomicHandler -->|"Bearer token + request payload"| TransactionApis
+    LookupApis --> Vendor
+    TransactionApis --> Vendor
 ```
 
-## Common Runtime Sequence
+## Token Acquisition Sequence
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant C as Client application
+    participant C as Client
+    participant M as DIB Auth Middleware
+    participant Cache as Redis DIB_ACCESS_TOKEN
+    participant P as DibTokenCredentialProvider
+    participant KV as Azure Key Vault
     participant T as Token API
-    participant W as CMS Wrapper endpoint
+    participant RC as RequestContext
+    participant F as Documented CMS Wrapper Function
+
+    C->>M: POST documented CMS Wrapper API request
+    M->>Cache: Read DIB_ACCESS_TOKEN
+    alt Cached access token exists
+        Cache-->>M: accessToken
+    else Cache miss
+        M->>P: GetCredentialsAsync()
+        P->>KV: Get secret AppVariables--BankApi--ID
+        KV-->>P: ID
+        P->>KV: Get secret AppVariables--BankApi--Password
+        KV-->>P: Password
+        P-->>M: GenerateDibTokenHandlerReqDTO
+        M->>T: POST /api/token/getToken {ID, Password}
+        T-->>M: {message, accessToken}
+        M->>Cache: Store DIB_ACCESS_TOKEN
+    end
+    M->>RC: SetDibToken(accessToken)
+    M->>F: Continue function execution
+```
+
+## Common API Runtime Sequence
+
+This sequence applies to the eleven documented business APIs after the bearer token is available.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant M as DIB Auth Middleware
+    participant F as Documented API Function
+    participant H as API Handler
+    participant A as CMS Wrapper Atomic Handler
+    participant RC as RequestContext
+    participant CMS as CMS Wrapper Endpoint
     participant V as TransPaymentAPI / Core-DMZ
 
-    C->>T: POST /api/token/getToken {ID, Password}
-    T-->>C: {message, accessToken}
+    C->>M: POST one documented API request
+    M->>M: Resolve DIB token from cache or Key Vault + Token API
+    M->>F: Execute function with token in RequestContext
+    F->>F: Deserialize request body
+    F->>F: Validate documented mandatory fields
+    F->>H: Handle request
+    H->>A: Build downstream request DTO
+    A->>RC: GetDibToken()
+    A->>CMS: POST documented endpoint with Bearer token
+    CMS->>V: Forward request to vendor/core system
+    V-->>CMS: Vendor response
+    CMS-->>A: ResponseCode, ResponseDescription, optional TransDetail
+    A-->>H: HttpResponseSnapshot
+    H->>H: Map downstream response
+    H-->>F: BaseResponseDTO
+    F-->>C: API response
+```
 
-    C->>W: POST one documented /api/endpoint/* API with Bearer JWT
-    W->>W: Verify JWT token
-    W->>W: Validate documented mandatory fields
-    W->>V: Forward mapped request to vendor endpoint
-    V-->>W: ResponseCode, ResponseDescription, optional TransDetail
-    W-->>C: Return documented response shape
+## Documented API Fan-Out
+
+```mermaid
+flowchart TD
+    TokenReady["DIB accessToken ready<br/>from Redis or Token API"]
+
+    subgraph Lookup["Lookup APIs from document"]
+        PrintLocation["GetPrintLocation<br/>POST /api/endpoint/getprintlocation"]
+        DeliverTo["GetDeliverTo<br/>POST /api/endpoint/getdeliverto"]
+        Product["GetProduct<br/>POST /api/endpoint/getproduct"]
+        Account["GetAccount<br/>POST /api/endpoint/getaccount"]
+        Instrument["GetInstrument<br/>POST /api/endpoint/getinstrument"]
+        FileTemplate["GetFileTemplate<br/>POST /api/endpoint/getfiletemplate"]
+        TitleFetch["TitleFetch<br/>POST /api/endpoint/titlefetch"]
+    end
+
+    subgraph Transaction["Transaction APIs from document"]
+        TransSubmit["TransSubmit<br/>POST /api/endpoint/transsubmit"]
+        GetStatus["GetStatus<br/>POST /api/endpoint/getstatus"]
+        ResendTxn["ResendTxn<br/>POST /api/endpoint/resendtxn"]
+        RejectTxn["RejectTxn<br/>POST /api/endpoint/rejecttxn"]
+    end
+
+    TokenReady --> PrintLocation
+    TokenReady --> DeliverTo
+    TokenReady --> Product
+    TokenReady --> Account
+    TokenReady --> Instrument
+    TokenReady --> FileTemplate
+    TokenReady --> TitleFetch
+    TokenReady --> TransSubmit
+    TokenReady --> GetStatus
+    TokenReady --> ResendTxn
+    TokenReady --> RejectTxn
 ```
 
 ## Transaction Lifecycle Using Documented APIs Only
@@ -115,7 +180,8 @@ sequenceDiagram
 ```mermaid
 flowchart TD
     Start(["Start"])
-    TokenCall["Token<br/>Get JWT accessToken"]
+    Credentials["Resolve Token credentials<br/>ID and Password from Key Vault"]
+    TokenCall["Token<br/>POST /api/token/getToken<br/>Get JWT accessToken"]
     Product["GetProduct<br/>Read PRODUCT_CODE values"]
     Account["GetAccount<br/>Requires ProductCode<br/>Returns ACCOUNTNO, ACCOUNTNAME"]
     Instrument["GetInstrument<br/>Requires ProductCode<br/>Returns INSTRUMENTNUMBER"]
@@ -131,7 +197,8 @@ flowchart TD
     Reject["RejectTxn<br/>Requires MakerID, REFNO, Remarks"]
     Done(["End"])
 
-    Start --> TokenCall
+    Start --> Credentials
+    Credentials --> TokenCall
     TokenCall --> Product
     Product --> Account
     Product --> Instrument
@@ -159,6 +226,11 @@ flowchart TD
 
 ```mermaid
 classDiagram
+    class KeyVaultCredentialSecrets {
+        +ID secret name
+        +Password secret name
+    }
+
     class TokenRequest {
         +ID M
         +Password M
@@ -211,6 +283,7 @@ classDiagram
         +TransDetail[]
     }
 
+    KeyVaultCredentialSecrets --> TokenRequest : populate
     TokenRequest --> TokenResponse : Token
     CommonLookupRequest --> DetailResponse : GetPrintLocation
     CommonLookupRequest --> DetailResponse : GetDeliverTo
